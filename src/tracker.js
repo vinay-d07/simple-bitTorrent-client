@@ -1,17 +1,26 @@
 const dgram = require("dgram");
+const http = require("http");
+const https = require("https");
 const tp = require("./torrentParser");
-const fs = require("fs");
 const b = require("../decode");
 const Buffer = require("buffer").Buffer;
 const urlParse = require("url").parse;
-const torrentBuf = fs.readFileSync("puppy.torrent");
-const decoded = b.bdecode(torrentBuf);
 const util = require("../utils");
 const crypto = require("crypto");
 
 module.exports.getpeers = (torrent, callback) => {
-  const socket = dgram.createSocket("udp4");
   const url = torrent.announce.toString("utf8");
+  if (url.startsWith("udp://")) {
+    getPeersUdp(torrent, url, callback);
+  } else if (url.startsWith("http://") || url.startsWith("https://")) {
+    getPeersHttp(torrent, url, callback);
+  } else {
+    console.log("Unsupported tracker protocol:", url);
+  }
+};
+
+function getPeersUdp(torrent, url, callback) {
+  const socket = dgram.createSocket("udp4");
 
   udpsend(socket, buildConnectReq(), url);
 
@@ -26,7 +35,82 @@ module.exports.getpeers = (torrent, callback) => {
       callback(announceResp.peers);
     }
   });
-};
+}
+
+// Percent-encode raw bytes per the HTTP tracker convention (RFC 3986
+// unreserved chars stay literal, everything else becomes %XX) — info_hash
+// and peer_id are raw 20-byte binary, not UTF-8 text, so encodeURIComponent
+// can't be used directly on them.
+function percentEncodeBytes(buf) {
+  let out = "";
+  for (const byte of buf) {
+    const isUnreserved =
+      (byte >= 0x41 && byte <= 0x5a) || // A-Z
+      (byte >= 0x61 && byte <= 0x7a) || // a-z
+      (byte >= 0x30 && byte <= 0x39) || // 0-9
+      byte === 0x2d || byte === 0x2e || byte === 0x5f || byte === 0x7e; // - . _ ~
+    out += isUnreserved
+      ? String.fromCharCode(byte)
+      : "%" + byte.toString(16).padStart(2, "0").toUpperCase();
+  }
+  return out;
+}
+
+function getPeersHttp(torrent, url, callback) {
+  const mod = url.startsWith("https://") ? https : http;
+  const infoHash = tp.infoHash(torrent);
+  const peerId = util.genId();
+  const left = torrent.info.files
+    ? torrent.info.files.reduce((a, f) => a + f.length, 0)
+    : torrent.info.length;
+
+  const qs =
+    `info_hash=${percentEncodeBytes(infoHash)}` +
+    `&peer_id=${percentEncodeBytes(peerId)}` +
+    `&port=6881&uploaded=0&downloaded=0&left=${left}&compact=1&event=started`;
+  const fullUrl = url + (url.includes("?") ? "&" : "?") + qs;
+
+  mod
+    .get(fullUrl, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        try {
+          const decoded = b.bdecode(Buffer.concat(chunks));
+          if (decoded["failure reason"]) {
+            console.log("Tracker failure:", decoded["failure reason"].toString());
+            return;
+          }
+          callback(parseHttpPeers(decoded.peers));
+        } catch (e) {
+          console.log("Failed to parse HTTP tracker response:", e.message);
+        }
+      });
+    })
+    .on("error", (e) => console.log("HTTP tracker request error:", e.message));
+}
+
+function parseHttpPeers(peersField) {
+  if (Buffer.isBuffer(peersField)) {
+    // compact format: 6 bytes per peer (4 IP + 2 port), same as UDP trackers
+    const peers = [];
+    for (let i = 0; i + 6 <= peersField.length; i += 6) {
+      peers.push({
+        ip: peersField.slice(i, i + 4).join("."),
+        port: peersField.readUInt16BE(i + 4),
+      });
+    }
+    return peers;
+  }
+  if (Array.isArray(peersField)) {
+    // non-compact dictionary model
+    return peersField.map((p) => ({
+      ip: p.ip.toString("utf8"),
+      port: p.port,
+    }));
+  }
+  return [];
+}
 
 function udpsend(socket, msg, rawUrl, callback = () => {}) {
   const trackerURL = urlParse(rawUrl);
@@ -91,10 +175,11 @@ function parseAnnounceResp(resp) {
   return {
     action: resp.readUInt32BE(0),
     transactionId: resp.readUInt32BE(4),
-    leechers: resp.readUInt32BE(8),
-    seeders: resp.readUInt32BE(12),
+    interval: resp.readUInt32BE(8),
+    leechers: resp.readUInt32BE(12),
+    seeders: resp.readUInt32BE(16),
     peers: (function() {
-      const peerBufs = group(resp.slice(16), 6).filter(b => b.length >= 6);
+      const peerBufs = group(resp.slice(20), 6).filter(b => b.length >= 6);
       return peerBufs.map((peerBuf) => ({
         ip: peerBuf.slice(0, 4).join('.'),
         port: peerBuf.readUInt16BE(4),

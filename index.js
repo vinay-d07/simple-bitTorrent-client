@@ -1,11 +1,12 @@
 const torrentParser = require("./src/torrentParser");
 const download = require("./src/download");
-const torrent = torrentParser.open("neo-geo-pocket-manuals_archive.torrent");
 
-// const torrent = torrentParser.open(process.argv[2]);
+const torrentPath = process.argv[2];
+if (!torrentPath) {
+  console.error("Usage: node index.js <path-to-torrent-file>");
+  process.exit(1);
+}
 
-download(torrent, torrent.info.name);
+const torrent = torrentParser.open(torrentPath);
 
-// tracker.getpeers(torrent, (peers) => {
-//   console.log(peers);
-// });
+download(torrent, torrent.info.name.toString("utf8"));

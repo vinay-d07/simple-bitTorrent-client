@@ -1,5 +1,6 @@
 const Buffer = require("buffer").Buffer;
 const torrentParser = require("./torrentParser");
+const util = require("../utils");
 
 module.exports.parse = (msg) => {
   const id = msg.length > 4 ? msg.readInt8(4) : null;
@@ -34,7 +35,7 @@ module.exports.buildHandshake = (torrent) => {
   // info hash
   torrentParser.infoHash(torrent).copy(buf, 28);
   // peer id
-  buf.write(util.genId());
+  util.genId().copy(buf, 48);
   return buf;
 };
 
@@ -88,9 +89,9 @@ module.exports.buildHave = (payload) => {
 };
 
 module.exports.buildBitfield = (bitfield) => {
-  const buf = Buffer.alloc(14);
+  const buf = Buffer.alloc(bitfield.length + 5);
   // length
-  buf.writeUInt32BE(payload.length + 1, 0);
+  buf.writeUInt32BE(bitfield.length + 1, 0);
   // id
   buf.writeUInt8(5, 4);
   // bitfield
